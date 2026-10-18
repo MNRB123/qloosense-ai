@@ -1,3 +1,4 @@
+
 import recommendationRoutes from "./recommendationRoutes.js";
 import express from "express";
 import cors from "cors";
@@ -18,7 +19,7 @@ app.get("/api/health", (_req, res) => {
     status: "ok",
     app: "QlooSense AI",
     qlooConfigured: Boolean(process.env.QLOO_API_KEY),
-    message: "Backend is running"
+    message: "Backend is running",
   });
 });
 
@@ -26,10 +27,16 @@ app.get("/", (_req, res) => {
   res.json({
     name: "QlooSense AI",
     description: "Personalized experience discovery",
-    status: "running"
+    status: "running",
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`QlooSense AI backend running at http://localhost:${PORT}`);
-});
+// Export the Express app for Vercel
+export default app;
+
+// Start a local server only when running this file directly
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`QlooSense AI backend running at http://localhost:${PORT}`);
+  });
+}
