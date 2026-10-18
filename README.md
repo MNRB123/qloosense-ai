@@ -1,49 +1,48 @@
-
 # QlooSense AI
 
-An agentic discovery application for personalized experiences,
-powered by Qloo taste intelligence.
+An AI-powered discovery application using Qloo taste intelligence to explore personalized experiences.
 
-## Current status
+## Project Status
 
-- Express and TypeScript backend configured
-- Health endpoint available
-- Recommendation request validation implemented
-- Qloo API integration pending API credential access
+- Express and TypeScript backend
+- Qloo API integration configured
+- Health check endpoint: `/api/health`
+- Location-based recommendations: `/api/recommendations`
+- Dietary preference verification remains in progress
 
-## Local setup
+## Requirements
 
-1. Install Node.js 22.19.0 or newer.
-2. Install dependencies:
+- Node.js 20 or newer
+- npm
 
-   ```bash
-   npm install
-   ```
+## Local Setup
 
-3. Create a local `.env` file using `.env.example`.
+1. Install dependencies:
+
+   `npm install`
+
+2. Copy `.env.example` to `.env`.
+3. Add your authorized Qloo API key to `.env`.
 4. Start the development server:
 
-   ```bash
-   npm run dev
-   ```
+   `npm run dev`
 
-5. Check the health endpoint:
+5. Check the health endpoint at `http://localhost:3000/api/health`.
 
-   `http://localhost:3000/api/health`
+## Environment Variables
+
+- `QLOO_API_KEY` — your authorized Qloo API key
+- `QLOO_BASE_URL` — Qloo API base URL
+- `PORT` — server port; defaults to 3000
 
 ## Build
 
-```bash
-npm run build
-```
+`npm run build`
 
 ## Security
 
-Never commit API credentials, `.env` files, or private user data.
+Never commit `.env`, API keys, or private user data. Dietary attributes must not be presented as verified without reliable evidence for the individual entity.
 
-## Hackathon project
+## Hackathon
 
-QlooSense AI is being developed for the Qloo Agentic Hackathon.
-The Qloo API integration and working recommendation flow are
-still in progress.
-
+Developed for the Qloo Agentic Hackathon to explore personalized discovery experiences.
