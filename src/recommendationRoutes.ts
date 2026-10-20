@@ -1,4 +1,3 @@
-﻿
 import { Router } from "express";
 import { z } from "zod";
 
@@ -10,345 +9,304 @@ const requestSchema = z.object({
   limit: z.number().int().min(1).max(10).optional().default(5),
 });
 
+type AgentLog = {
+  step: string;
+  status: "success" | "info" | "warning" | "error";
+  message: string;
+  count?: number;
+  durationMs?: number;
+};
+
 type QlooEntity = {
+  entity_id?: string;
   name?: string;
   disambiguation?: string;
   properties?: {
-    primary_genre?: {
-      name?: string;
-    };
-    localities?: Array<{
-      name?: string;
-    }>;
+    address?: string;
+    description?: string;
+    geocode?: { city?: string; country?: string; country_code?: string };
+    primary_genre?: { id?: string; name?: string };
+    localities?: Array<{ name?: string }>;
   };
 };
 
-router.post("/", async (req, res) => {
-  const parsed = requestSchema.safeParse(req.body);
+type QlooSearchResponse = { results?: Array<{ entity_id?: string; name?: string }> };
+type QlooInsightsResponse = {
+  results?: { entities?: QlooEntity[]; [key: string]: unknown };
+  [key: string]: unknown;
+};
 
-  if (!parsed.success) {
-    return res.status(400).json({
-      error: "Please provide valid interests and city.",
-    });
+type Input = z.infer<typeof requestSchema>;
+type QlooRunResult = {
+  status: "success" | "no_matches";
+  city: string;
+  interests: string;
+  matchedEntity: string | null;
+  recommendationCount: number;
+  recommendations: QlooEntity[];
+  logs: AgentLog[];
+};
+
+function uniqueByName(entities: QlooEntity[]): QlooEntity[] {
+  const seen = new Set<string>();
+  return entities.filter((entity) => {
+    const key = entity.name?.trim().toLocaleLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function addLog(
+  logs: AgentLog[],
+  step: string,
+  status: AgentLog["status"],
+  message: string,
+  extras: Pick<AgentLog, "count" | "durationMs"> = {}
+) {
+  logs.push({ step, status, message, ...extras });
+}
+
+/** A transparent, deterministic baseline. It does not call an LLM or invent venue names. */
+function buildBaseline(input: Input) {
+  const text = input.interests.toLowerCase();
+  let category = "local experiences matching your interest";
+  if (/gallery|galleries|art|museum|culture|heritage|exhibition/.test(text)) {
+    category = "art galleries, museums, and cultural spaces";
+  } else if (/restaurant|food|dining|vegetarian|vegan|cafe|eatery/.test(text)) {
+    category = "restaurants and cafes matching your food preference";
+  } else if (/park|nature|garden|outdoor/.test(text)) {
+    category = "parks, gardens, and outdoor spaces";
+  } else if (/music|concert|theatre|theater|show/.test(text)) {
+    category = "music, theatre, and live-event venues";
   }
 
+  return {
+    mode: "without_qloo_baseline",
+    source: "Deterministic keyword baseline; no Qloo lookup and no LLM call",
+    status: "baseline_only",
+    city: input.city,
+    interests: input.interests,
+    recommendations: [],
+    explanation: `A generic baseline would suggest exploring ${category} in ${input.city}. It cannot verify specific venues, current entity metadata, or city-level matches without a data source.`,
+  };
+}
+
+async function runQloo(input: Input): Promise<QlooRunResult> {
+  const logs: AgentLog[] = [];
+  const startedAt = Date.now();
   const apiKey = process.env.QLOO_API_KEY;
-  const baseUrl =
-    process.env.QLOO_BASE_URL || "https://hackathon.api.qloo.com";
+  const baseUrl = process.env.QLOO_BASE_URL || "https://hackathon.api.qloo.com";
+  const interests = input.interests;
+  const city = input.city;
+  const normalizedInterests = interests.toLowerCase();
+  const cityName = city.trim().toLocaleLowerCase();
 
+  addLog(logs, "query_received", "success", `Received interest '${interests}' for ${city}.`);
   if (!apiKey) {
-    return res.status(503).json({
-      error: "Qloo API is not configured on the server.",
-    });
+    addLog(logs, "qloo_configuration", "error", "Qloo API key is not configured.");
+    throw Object.assign(new Error("Qloo API is not configured on the server."), { logs, statusCode: 503 });
   }
+  addLog(logs, "qloo_configuration", "success", "Qloo API key is configured; key value is never logged.");
 
-  try {
+  const isArtsSearch = /art|gallery|galleries|museum|culture|cultural|heritage|exhibition|theatre|theater|craft/i.test(interests);
+  const isGalleryRequest = /gallery|galleries/i.test(interests);
+  const isRestaurantRequest = /restaurant|restaurants|food|dining|vegetarian|vegan|cafe|eatery/i.test(interests);
+  const isVegetarianRequest = /vegetarian|vegan|pure\s*veg|jain|शाकाहारी/i.test(interests);
+  addLog(logs, "intent_classification", "success", `Classified request as ${isArtsSearch ? "arts/culture" : isRestaurantRequest ? "food/dining" : "general place discovery"}.`);
+
+  let entityId: string | undefined;
+  if (!isArtsSearch) {
+    const searchStarted = Date.now();
     const searchUrl = new URL("/search", baseUrl);
-    const isArtsSearch =
-  /art|gallery|galleries|museum|culture|cultural|heritage|exhibition/i.test(
-    parsed.data.interests
-  );
-
-    const searchQuery = isArtsSearch
-  ? `art gallery museum in ${parsed.data.city}, Gujarat, India`
-  : `${parsed.data.interests} in ${parsed.data.city}, India`;
-
-      searchUrl.searchParams.set("query", searchQuery);
-      searchUrl.searchParams.set("types", "urn:entity:place");
-
+    searchUrl.searchParams.set("query", `${interests} in ${city}, India`);
+    searchUrl.searchParams.set("types", "urn:entity:place");
+    addLog(logs, "qloo_search", "info", "Searching Qloo for a place entity to use as a relevance signal.");
     const searchResponse = await fetch(searchUrl, {
-      headers: {
-        "X-Api-Key": apiKey,
-        Accept: "application/json",
-      },
+      headers: { "X-Api-Key": apiKey, Accept: "application/json" },
       signal: AbortSignal.timeout(15000),
     });
-
     if (!searchResponse.ok) {
-      return res.status(502).json({
-        error: "Qloo entity search failed.",
-        upstreamStatus: searchResponse.status,
-      });
+      addLog(logs, "qloo_search", "error", `Qloo Search returned HTTP ${searchResponse.status}.`, { durationMs: Date.now() - searchStarted });
+      throw Object.assign(new Error("Qloo entity search failed."), { logs, statusCode: 502 });
     }
-
-    const searchData = (await searchResponse.json()) as {
-      results?: Array<{ entity_id?: string; name?: string }>;
-    };
-
-    console.log("Search query:", searchUrl.toString());
-    console.log("Qloo search candidates:", JSON.stringify(searchData.results, null, 2));
-
-    console.log(
-    "Qloo search candidates:",
-      searchData.results?.slice(0, 10).map((item) => ({
-      name: item.name,
-      entity_id: item.entity_id,
-    }))
-    );
-
-
-
-
-const candidates = searchData.results ?? [];
-
-
-const selectedEntity = isArtsSearch
-  ? candidates.find((item) =>
-      /art gallery|gallery|museum|cultural centre|cultural center|art centre|art center/i.test(
-        item.name ?? ""
-      )
-    )
-  : candidates[0];
-
-console.log(
-  "Qloo search candidates:",
-  candidates.map((item) => ({
-    name: item.name,
-    entity_id: item.entity_id,
-  }))
-);
-
-console.log(
-  "Selected Qloo entity:",
-  selectedEntity?.name ?? "No suitable entity found"
-);
-
-const entityId = selectedEntity?.entity_id;
-
-
-console.log(
-  "Selected Qloo entity:",
-  selectedEntity?.name ?? "No suitable entity found",
-  entityId ?? ""
-);
-
+    const searchData = (await searchResponse.json()) as QlooSearchResponse;
+    const selectedEntity = searchData.results?.find((item) => item.entity_id);
+    entityId = selectedEntity?.entity_id;
+    addLog(logs, "qloo_search", entityId ? "success" : "warning", entityId ? `Selected entity signal: ${selectedEntity?.name ?? "unnamed entity"}.` : "No entity signal was found.", { count: searchData.results?.length ?? 0, durationMs: Date.now() - searchStarted });
     if (!entityId) {
-      return res.status(200).json({
-        status: "no_matches",
-        recommendations: [],
-        message: "No matching Qloo entities were found.",
-      });
+      addLog(logs, "result", "warning", "No matching Qloo entity was found for the interest query.");
+      return { status: "no_matches", city, interests, matchedEntity: null, recommendationCount: 0, recommendations: [], logs };
     }
+  } else {
+    addLog(logs, "qloo_search", "info", "Skipped text-entity signal for arts searches; using explicit category tags to reduce wrong-city matches.");
+  }
 
-const isVegetarianRequest =
-  /vegetarian|vegan|pure veg|jain|à¤¶à¤¾à¤•à¤¾à¤¹à¤¾à¤°à¥€/i.test(
-    parsed.data.interests
-  );
+  const params = new URLSearchParams({
+    "filter.type": "urn:entity:place",
+    "filter.location.query": city,
+    take: String(input.limit),
+  });
+  if (isArtsSearch) {
+    let artsTag: string;
+    if (/museum/i.test(normalizedInterests)) artsTag = "urn:tag:genre:place:art_museum";
+    else if (/culture|heritage/i.test(normalizedInterests) && !/gallery|galleries|art/i.test(normalizedInterests)) artsTag = "urn:tag:category:place:culture";
+    else artsTag = "urn:tag:genre:place:art_gallery";
+    params.set("filter.tags", artsTag);
+    addLog(logs, "query_planning", "success", `Using Qloo category tag ${artsTag}.`);
+  } else if (entityId) {
+    params.set("signal.interests.entities", entityId);
+    addLog(logs, "query_planning", "success", "Using the selected Qloo entity as an interest signal.");
+  }
+  if (isVegetarianRequest) {
+    params.set("filter.tags", "urn:tag:genre:place:restaurant:vegetarian");
+    addLog(logs, "dietary_filter", "info", "Applied the Qloo vegetarian restaurant tag. Returned data is not treated as a dietary guarantee.");
+  }
 
+  const insightsStarted = Date.now();
+  addLog(logs, "qloo_insights", "info", "Requesting location-aware recommendations from Qloo Insights.");
+  const insightsUrl = new URL("/v2/insights", baseUrl);
+  insightsUrl.search = params.toString();
+  const insightsResponse = await fetch(insightsUrl, {
+    headers: { "X-Api-Key": apiKey, Accept: "application/json" },
+    signal: AbortSignal.timeout(20000),
+  });
+  const responseText = await insightsResponse.text();
+  if (!insightsResponse.ok) {
+    addLog(logs, "qloo_insights", "error", `Qloo Insights returned HTTP ${insightsResponse.status}.`, { durationMs: Date.now() - insightsStarted });
+    throw Object.assign(new Error("Qloo Insights request failed."), { logs, statusCode: 502 });
+  }
+  const qlooData = JSON.parse(responseText) as QlooInsightsResponse;
+  let entities: QlooEntity[] = qlooData.results?.entities ?? [];
+  addLog(logs, "qloo_insights", "success", "Received Qloo Insights response.", { count: entities.length, durationMs: Date.now() - insightsStarted });
 
-
-const params = new URLSearchParams({
-  "filter.type": "urn:entity:place",
-  "filter.location.query": parsed.data.city,
-  take: String(parsed.data.limit),
-});
-
-if (isArtsSearch) {
-  const interests = parsed.data.interests.toLowerCase();
-
-  const artsTag = /museum/i.test(interests)
-    ? "urn:tag:genre:place:museum"
-    : /culture|heritage/i.test(interests) &&
-        !/gallery|galleries|art/i.test(interests)
-      ? "urn:tag:category:place:culture"
-      : "urn:tag:genre:place:art_gallery";
-
-  params.set("filter.tags", artsTag);
-} else {
-  params.set("signal.interests.entities", entityId);
-}
-
-
-
-if (isVegetarianRequest) {
-  params.set(
-    "filter.tags",
-    "urn:tag:genre:place:restaurant:vegetarian"
-  );
-}
-
-    const insightsUrl = new URL("/v2/insights", baseUrl);
-    insightsUrl.search = params.toString();
-
-    console.log("Qloo Insights URL:", insightsUrl.toString());
-    console.log("Qloo matched entity:", searchData.results?.[0]);
-
-    const insightsResponse = await fetch(insightsUrl, {
-      headers: {
-        "X-Api-Key": apiKey,
-        Accept: "application/json",
-      },
+  if (isArtsSearch && isGalleryRequest && entities.length < input.limit) {
+    const fallbackStarted = Date.now();
+    const fallbackParams = new URLSearchParams(params);
+    fallbackParams.set("filter.tags", "urn:tag:genre:place:art_museum");
+    const fallbackUrl = new URL("/v2/insights", baseUrl);
+    fallbackUrl.search = fallbackParams.toString();
+    addLog(logs, "category_fallback", "info", "Gallery results are limited; trying the related art-museum category.");
+    const fallbackResponse = await fetch(fallbackUrl, {
+      headers: { "X-Api-Key": apiKey, Accept: "application/json" },
       signal: AbortSignal.timeout(20000),
     });
-
-    const responseText = await insightsResponse.text();
-
-    if (!insightsResponse.ok) {
-      return res.status(502).json({
-        error: "Qloo Insights request failed.",
-        upstreamStatus: insightsResponse.status,
-        details: responseText.slice(0, 500),
-      });
+    if (fallbackResponse.ok) {
+      const fallbackData = (await fallbackResponse.json()) as QlooInsightsResponse;
+      const fallbackEntities = fallbackData.results?.entities ?? [];
+      entities = uniqueByName([...entities, ...fallbackEntities]);
+      addLog(logs, "category_fallback", "success", "Merged unique results from the related museum category.", { count: fallbackEntities.length, durationMs: Date.now() - fallbackStarted });
+    } else {
+      addLog(logs, "category_fallback", "warning", `Fallback returned HTTP ${fallbackResponse.status}; continuing with primary results.`, { durationMs: Date.now() - fallbackStarted });
     }
+  }
 
-    const qlooData = JSON.parse(responseText);
-    const entities: QlooEntity[] = qlooData?.results?.entities ?? [];
-    console.log("Raw Qloo entity count:", entities.length);
-    console.log(
-  "Raw Qloo entities:",
-  entities.map((entity) => {
-    const properties = entity.properties as {
-      address?: string;
-      geocode?: { city?: string };
-      primary_genre?: { id?: string; name?: string };
-    } | undefined;
+  const beforeFiltering = uniqueByName(entities);
+  addLog(logs, "deduplication", "success", "Removed duplicate or unnamed entities.", { count: beforeFiltering.length });
+  const finalEntities = beforeFiltering.filter((entity) => {
+    const properties = entity.properties;
+    const name = entity.name?.toLowerCase() ?? "";
+    const genre = properties?.primary_genre?.name?.toLowerCase() ?? "";
+    const genreId = properties?.primary_genre?.id?.toLowerCase() ?? "";
+    const address = properties?.address?.toLowerCase() ?? "";
+    const geocodeCity = properties?.geocode?.city?.toLowerCase() ?? "";
+    const country = properties?.geocode?.country?.toLowerCase() ?? "";
+    const countryCode = properties?.geocode?.country_code?.toLowerCase() ?? "";
+    const matchesCity = geocodeCity === cityName || address.includes(`${cityName},`) || address.includes(`${cityName} `) || address.startsWith(`${cityName} `);
+    const isIndianPlace = country === "india" || countryCode === "in" || address.includes("india");
+    const matchesRestaurant = /restaurant|food|dining|cafe|fast food|eatery|pizza|breakfast|sweets|ice cream|khaman|khichdi/i.test(`${name} ${genre}`);
+    const matchesArts = /art gallery|gallery|museum|cultural centre|cultural center|art centre|art center|exhibition|theatre|theater/i.test(`${name} ${genre}`) || genreId.includes("art_gallery") || genreId.includes("art_museum") || genreId.includes(":museum");
+    const matchesVegetarian = genreId === "urn:tag:genre:place:restaurant:vegetarian" || /vegetarian|vegan|pure\s*veg|jain|शाकाहारी/i.test(`${genre} ${properties?.description ?? ""}`);
+    if (!matchesCity || !isIndianPlace) return false;
+    if (isRestaurantRequest && !matchesRestaurant) return false;
+    if (isVegetarianRequest && !matchesVegetarian) return false;
+    if (isArtsSearch && !matchesArts) return false;
+    return true;
+  });
+  addLog(logs, "location_category_validation", "success", "Applied city, India, and relevant-category checks.", { count: finalEntities.length });
+  const limitedEntities = finalEntities.slice(0, input.limit);
+  addLog(logs, "result", limitedEntities.length ? "success" : "warning", limitedEntities.length ? "Final recommendations are ready." : "Qloo returned data, but no results passed the strict validation checks.", { count: limitedEntities.length, durationMs: Date.now() - startedAt });
 
-    return {
-      name: entity.name,
-      address: properties?.address,
-      city: properties?.geocode?.city,
-      genre: properties?.primary_genre?.name,
-      genreId: properties?.primary_genre?.id,
-    };
-  })
-);
+  return {
+    status: limitedEntities.length > 0 ? "success" : "no_matches",
+    city,
+    interests,
+    matchedEntity: limitedEntities[0]?.name ?? null,
+    recommendationCount: limitedEntities.length,
+    recommendations: limitedEntities,
+    logs,
+  } satisfies QlooRunResult;
+}
 
-    const cityName = parsed.data.city.toLowerCase();
+// Existing endpoint: retains the existing /api/recommendations contract, with added trace metadata.
+router.post("/", async (req, res) => {
+  const parsed = requestSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Please provide valid interests and city." });
 
-    const isRestaurantRequest =
-      /restaurant|restaurants|food|dining|vegetarian|vegan/i.test(
-        parsed.data.interests
-      );
-
-
-const filteredEntities = entities.filter((entity) => {
-  const properties = entity.properties as {
-    address?: string;
-    geocode?: {
-      city?: string;
-      country?: string;
-    };
-    primary_genre?: {
-      name?: string;
-      id?: string;
-    };
-  } | undefined;
-
-  const genre =
-    properties?.primary_genre?.name?.toLowerCase() ?? "";
-
-  const address =
-    properties?.address?.toLowerCase() ?? "";
-
-  const geocodeCity =
-    properties?.geocode?.city?.toLowerCase() ?? "";
-
-  const isIndianPlace =
-    properties?.geocode?.country?.toLowerCase() === "india" ||
-    address.includes("india");
-
-  const matchesCity =
-    geocodeCity === cityName ||
-    address.includes(cityName);
-
-  const matchesRestaurant =
-    /restaurant|food|dining|cafe|fast food|eatery|pizza|breakfast|sweets|ice cream/i.test(
-      genre
-    );
-
-  const description =
-  (properties as { description?: string } | undefined)
-    ?.description?.toLowerCase() ?? "";
-
-const matchesVegetarian =
-  properties?.primary_genre?.id ===
-    "urn:tag:genre:place:restaurant:vegetarian" ||
-  /vegetarian|vegan|pure.?veg|jain/i.test(
-    `${genre} ${description}`
-  );
-
-  return (
-    isIndianPlace &&
-    matchesCity &&
-    (!isRestaurantRequest || matchesRestaurant) &&
-    (!isVegetarianRequest || matchesVegetarian)
-  );
-});
-
-
-const interestText = parsed.data.interests.toLowerCase();
-
-const isArtsRequest =
-  /art|gallery|galleries|museum|cultural|culture|heritage|exhibition|theatre|theater|craft/i.test(
-    interestText
-  );
-
-const relevantEntities = entities.filter((entity) => {
-  const properties = entity.properties as {
-    address?: string;
-    geocode?: { city?: string; country?: string };
-    primary_genre?: { name?: string; id?: string };
-  } | undefined;
-
-  const name = entity.name?.toLowerCase() ?? "";
-  const genre = properties?.primary_genre?.name?.toLowerCase() ?? "";
-  const address = properties?.address?.toLowerCase() ?? "";
-  const geocodeCity = properties?.geocode?.city?.toLowerCase() ?? "";
-
-  const matchesCity =
-    geocodeCity.includes(cityName) || address.includes(cityName);
-
-  const matchesRestaurant =
-    /restaurant|food|dining|cafe|fast food|eatery|pizza|breakfast|sweets|ice cream|khaman|khichdi/i.test(
-      `${name} ${genre}`
-    );
-
-  const matchesArts =
-    /art gallery|gallery|museum|cultural centre|cultural center|heritage site|art museum|exhibition space|art centre|art center|theatre|theater/i.test(
-      `${name} ${genre}`
-    );
-
-  const matchesRequestedCategory = isRestaurantRequest
-    ? matchesRestaurant
-    : isArtsRequest
-      ? matchesArts
-      : true;
-
-  return matchesCity && matchesRequestedCategory;
-});
-
-const finalEntities = isArtsRequest
-  ? relevantEntities
-  : relevantEntities.length > 0
-    ? relevantEntities
-    : filteredEntities;
-
-
-
+  try {
+    const result = await runQloo(parsed.data);
     return res.status(200).json({
-      status: finalEntities.length > 0 ? "success" : "no_matches",
-      city: parsed.data.city,
-      interests: parsed.data.interests,
-      dietaryPreferenceVerified: isVegetarianRequest
-  ? false
-  : null,
-      matchedEntity: searchData.results?.[0]?.name,
-      recommendations: {
-        ...qlooData,
-        results: {
-          ...qlooData.results,
-          entities: finalEntities,
+      status: result.status,
+      city: result.city,
+      interests: result.interests,
+      matchedEntity: result.matchedEntity,
+      dietaryPreferenceVerified: /vegetarian|vegan|pure\s*veg|jain|शाकाहारी/i.test(result.interests) ? false : null,
+      recommendations: { results: { entities: result.recommendations } },
+      agent: { recommendationCount: result.recommendationCount, logs: result.logs },
+      message: result.status === "no_matches" ? "No recommendations passed the current matching and validation rules." : undefined,
+    });
+  } catch (error) {
+    const err = error as Error & { statusCode?: number; logs?: AgentLog[] };
+    console.error("Qloo recommendation error:", err.message);
+    return res.status(err.statusCode ?? 502).json({ error: err.message || "Unable to retrieve recommendations from Qloo.", agent: { logs: err.logs ?? [] } });
+  }
+});
+
+// Comparison endpoint: POST /api/recommendations/compare
+// Baseline is deliberately transparent and does not pretend to be a ChatGPT/LLM call.
+router.post("/compare", async (req, res) => {
+  const parsed = requestSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Please provide valid interests and city." });
+
+  const baseline = buildBaseline(parsed.data);
+  const baselineLogs: AgentLog[] = [
+    { step: "query_received", status: "success", message: "Same user input received for baseline comparison." },
+    { step: "baseline_generation", status: "success", message: "Created a generic keyword-based suggestion; no named venues were invented." },
+    { step: "data_limitations", status: "info", message: "Baseline does not verify real venue names, city metadata, or category tags." },
+  ];
+
+  try {
+    const qloo = await runQloo(parsed.data);
+    return res.status(200).json({
+      query: { interests: parsed.data.interests, city: parsed.data.city, limit: parsed.data.limit },
+      comparison: {
+        withoutQloo: { ...baseline, logs: baselineLogs },
+        withQloo: {
+          mode: "with_qloo",
+          source: "Qloo Search/Insights API plus application-side validation",
+          status: qloo.status,
+          city: qloo.city,
+          interests: qloo.interests,
+          matchedEntity: qloo.matchedEntity,
+          recommendationCount: qloo.recommendationCount,
+          recommendations: qloo.recommendations,
+          explanation: "These are Qloo-returned entities that passed the app's current city, country, and category filters. A result count of zero is reported honestly.",
+          logs: qloo.logs,
         },
+      },
+      summary: {
+        baselineHasVerifiedVenueData: false,
+        qlooVerifiedResultCount: qloo.recommendationCount,
+        note: "The baseline is a deterministic non-Qloo comparison, not a ChatGPT model response. No model API is called by this endpoint.",
       },
     });
   } catch (error) {
-    console.error(
-      "Qloo recommendation error:",
-      error instanceof Error ? error.message : "Unknown error"
-    );
-
-    return res.status(502).json({
-      error: "Unable to retrieve recommendations from Qloo.",
+    const err = error as Error & { statusCode?: number; logs?: AgentLog[] };
+    console.error("Qloo comparison error:", err.message);
+    return res.status(err.statusCode ?? 502).json({
+      query: { interests: parsed.data.interests, city: parsed.data.city, limit: parsed.data.limit },
+      comparison: { withoutQloo: { ...baseline, logs: baselineLogs }, withQloo: { status: "error", recommendations: [], logs: err.logs ?? [] } },
+      error: err.message || "Unable to complete Qloo comparison.",
     });
   }
 });
